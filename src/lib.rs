@@ -9,7 +9,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Buffer frame allow to read new data and retain some part of buffer
 pub struct Frame {
-	reserved: usize,
+	preserved: usize,
 	capacity: usize,
 	buf: BytesMut,
 	#[cfg(feature = "monoio")]
@@ -21,12 +21,12 @@ pub struct Frame {
 }
 
 impl Frame {
-	pub fn new(capacity: usize, reserved: usize) -> Self {
-		if reserved < (capacity >> 2) { panic!("Please use larger buffer size") }
+	pub fn new(capacity: usize, preserved: usize) -> Self {
+		if preserved < (capacity >> 2) { panic!("Please use larger buffer size") }
 		Self {
 			buf: BytesMut::with_capacity(capacity),
 			capacity,
-			reserved,
+			preserved,
 			#[cfg(feature = "monoio")]
 			spare_buf: Some(BytesMut::with_capacity(0)),
 			#[cfg(feature = "read_monoio_file")]
@@ -38,7 +38,7 @@ impl Frame {
 
 	#[inline]
 	fn reserve(&mut self) {
-		self.buf.reserve(self.capacity - self.reserved)
+		self.buf.reserve(self.capacity - self.preserved)
 	}
 
 	pub fn extend_from_slice(&mut self, slice: &[u8]) -> usize {
@@ -57,7 +57,7 @@ impl Frame {
 					break Ok(false);
 				}
 				Ok(n) => {
-					if n < (self.reserved << 1) {
+					if n < (self.preserved << 1) {
 						continue;
 					} else {
 						break Ok(true);
@@ -82,7 +82,7 @@ impl Frame {
 			match res {
 				Ok(0) => { break Ok(false); }
 				Ok(n) => {
-					if n < (self.reserved << 1) {
+					if n < (self.preserved << 1) {
 						continue;
 					} else {
 						break Ok(true);
@@ -107,7 +107,7 @@ impl Frame {
 				Ok(0) => { break Ok(false); }
 				Ok(n) => {
 					self.offset += n as u64;
-					if n < (self.reserved << 1) {
+					if n < (self.preserved << 1) {
 						continue;
 					} else {
 						break Ok(true);
@@ -119,7 +119,7 @@ impl Frame {
 	}
 
 	pub fn consume(&mut self) -> BytesMut {
-		self.buf.split_to(self.buf.len() - self.reserved)
+		self.buf.split_to(self.buf.len() - self.preserved)
 	}
 }
 
