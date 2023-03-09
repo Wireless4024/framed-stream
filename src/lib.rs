@@ -1,4 +1,5 @@
-use std::io;
+extern crate core;
+
 use std::ops::Deref;
 
 use bytes::BytesMut;
@@ -11,11 +12,10 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 pub struct Frame {
 	preserved: usize,
 	capacity: usize,
+	written: u64,
 	buf: BytesMut,
 	#[cfg(feature = "monoio")]
 	spare_buf: Option<BytesMut>,
-	#[cfg(feature = "read_monoio_file")]
-	offset: u64,
 	#[cfg(feature = "monoio")]
 	_marker: std::marker::PhantomPinned,
 }
@@ -29,10 +29,9 @@ impl Frame {
 			preserved,
 			#[cfg(feature = "monoio")]
 			spare_buf: Some(BytesMut::with_capacity(0)),
-			#[cfg(feature = "read_monoio_file")]
-			offset: 0,
 			#[cfg(feature = "monoio")]
 			_marker: std::marker::PhantomPinned,
+			written: 0,
 		}
 	}
 
@@ -41,15 +40,17 @@ impl Frame {
 		self.buf.reserve(self.capacity - self.preserved)
 	}
 
+	/// Push slice into buffer
 	pub fn extend_from_slice(&mut self, slice: &[u8]) -> usize {
 		self.reserve();
 		let need = (self.buf.capacity() - self.buf.len()).min(slice.len());
 		self.buf.extend_from_slice(&slice[..need]);
+		self.written += need as u64;
 		need
 	}
 
 	#[cfg(feature = "tokio")]
-	pub async fn read_tokio<R: AsyncRead + Unpin>(&mut self, reader: &mut R) -> io::Result<bool> {
+	pub async fn read_tokio<R: AsyncRead + Unpin>(&mut self, reader: &mut R) -> std::io::Result<bool> {
 		self.reserve();
 		loop {
 			match reader.read_buf(&mut self.buf).await {
@@ -57,6 +58,7 @@ impl Frame {
 					break Ok(false);
 				}
 				Ok(n) => {
+					self.written += n as u64;
 					if n < (self.preserved << 1) {
 						continue;
 					} else {
@@ -71,7 +73,7 @@ impl Frame {
 	}
 
 	#[cfg(feature = "monoio")]
-	pub async fn read_monoio<R: AsyncReadRent + Unpin>(&mut self, reader: &mut R) -> io::Result<bool> {
+	pub async fn read_monoio<R: AsyncReadRent + Unpin>(&mut self, reader: &mut R) -> std::io::Result<bool> {
 		self.reserve();
 		let mut spare = self.spare_buf.take().unwrap_or_default();
 		std::mem::swap(&mut spare, &mut self.buf);
@@ -82,6 +84,7 @@ impl Frame {
 			match res {
 				Ok(0) => { break Ok(false); }
 				Ok(n) => {
+					self.written += n as u64;
 					if n < (self.preserved << 1) {
 						continue;
 					} else {
@@ -94,19 +97,19 @@ impl Frame {
 	}
 
 	#[cfg(feature = "read_monoio_file")]
-	pub async fn read_monoio_file(&mut self, reader: &monoio::fs::File) -> io::Result<bool> {
+	pub async fn read_monoio_file(&mut self, reader: &monoio::fs::File) -> std::io::Result<bool> {
 		self.reserve();
 		let mut spare = self.spare_buf.take().unwrap_or_default();
 		std::mem::swap(&mut spare, &mut self.buf);
 		loop {
 			let buf = spare.split_off(spare.len());
-			let (res, buf) = reader.read_at(buf, self.offset).await;
+			let (res, buf) = reader.read_at(buf, self.written).await;
 			spare.unsplit(buf);
 			std::mem::swap(&mut spare, &mut self.buf);
 			match res {
 				Ok(0) => { break Ok(false); }
 				Ok(n) => {
-					self.offset += n as u64;
+					self.written += n as u64;
 					if n < (self.preserved << 1) {
 						continue;
 					} else {
@@ -118,8 +121,22 @@ impl Frame {
 		}
 	}
 
+	/// Get current slice of data and advance buffer
 	pub fn consume(&mut self) -> BytesMut {
 		self.buf.split_to(self.buf.len() - self.preserved)
+	}
+
+	/// Get all buffer without preserving
+	pub fn finish(self) -> BytesMut {
+		// if written more than existing mean already preserve data at start
+		if self.written > self.buf.len() as u64 {
+			let mut buf = self.buf;
+			let _ = buf.split_to(self.preserved);
+			buf
+		} else {
+			// single buffer
+			self.buf
+		}
 	}
 }
 
@@ -141,12 +158,13 @@ mod tests {
 		let ptr = bytes.buf.as_ptr() as usize;
 		assert_eq!(bytes.extend_from_slice(b"Hello"), 5);
 		assert_eq!(bytes.deref(), b"Hello");
-		bytes.consume();
+		assert_eq!(&bytes.consume()[..], b"Hel");
 		bytes.extend_from_slice(b"west");
 		let ptr2 = bytes.buf.as_ptr() as usize;
 		assert_eq!(bytes.deref(), b"lowest");
 		// check that no reallocation caused
 		assert_eq!(ptr, ptr2);
+		assert_eq!(bytes.finish().as_ref(), b"west");
 	}
 
 	#[cfg(feature = "tokio")]
